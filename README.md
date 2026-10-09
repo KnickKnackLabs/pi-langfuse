@@ -1,12 +1,23 @@
-# Langfuse Observability Plugin for pi
+# Langfuse Observability Plugin for pi — KnickKnackLabs fork
+
+[KnickKnackLabs/pi-langfuse](https://github.com/KnickKnackLabs/pi-langfuse) is a
+source-only fork of the official
+[langfuse/pi-observability-plugin](https://github.com/langfuse/pi-observability-plugin),
+originally authored by Langfuse. The package is marked private to prevent npm
+publication; its retained `@langfuse/pi-observability-plugin` name identifies the
+upstream package, not a fork-owned npm release.
+
+Concurrent embedded-session isolation is not fixed yet. The setup below describes
+the inherited CLI behavior, not a supported concurrent embedding API.
 
 This extension sends [pi coding agent](https://pi.dev) sessions to
 [Langfuse](https://langfuse.com). It records the user prompts, the agent turns,
 the model generations with their tokens and cost, and the tool calls.
 
-The full setup guide is the
+The upstream setup guide is the
 [Pi Agent integration page](https://langfuse.com/integrations/developer-tools/pi-agent),
-which also covers troubleshooting.
+which also covers troubleshooting. Its npm installation instructions install
+upstream, not this fork.
 
 > [!WARNING]
 > This is an experimental release, so future versions can bring breaking changes.
@@ -36,14 +47,17 @@ Pi needs Node.js 22.0.0 or newer, and pi's package installer shells out to
 
 ## Install
 
+Use a local checkout of this fork with dependencies installed (see
+[Development](#development)):
+
 ```bash
-pi install npm:@langfuse/pi-observability-plugin
+pi install /absolute/path/to/pi-langfuse
 ```
 
-To try it for a single run, without installing:
+To try that checkout for a single run, without installing:
 
 ```bash
-pi -e npm:@langfuse/pi-observability-plugin
+pi -e /absolute/path/to/pi-langfuse/src/index.ts
 ```
 
 ## Add your Langfuse credentials
@@ -97,7 +111,7 @@ a single value without editing the file.
 | One run                 | `LANGFUSE_TRACING_ENABLED=false pi`                         |
 | The current shell       | `export LANGFUSE_TRACING_ENABLED=false` (undo with `unset`) |
 | Global or project scope | `pi config`, then switch the extension off                  |
-| Remove the plugin       | `pi remove npm:@langfuse/pi-observability-plugin`           |
+| Remove the plugin       | `pi remove /absolute/path/to/pi-langfuse`                  |
 
 The kill switch has priority over environment keys and the config file. When
 tracing is off, the status line shows `langfuse: off (no keys)` and nothing is
@@ -122,42 +136,17 @@ is no build step. Therefore `files` in `package.json` holds only `src`,
 To run a local checkout against pi:
 
 ```bash
-pi install /absolute/path/to/pi-observability-plugin
+pi install /absolute/path/to/pi-langfuse
 ```
 
-Remove it again with `pi remove /absolute/path/to/pi-observability-plugin`.
+Remove it again with `pi remove /absolute/path/to/pi-langfuse`.
 
-## Release
+## Fork distribution
 
-1. Update the version in `package.json` and `EXTENSION_VERSION` in
-   `src/index.ts`, then merge the version bump into `main`.
-2. Tag that commit with the matching `v`-prefixed version and push the tag:
-
-   ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
-   ```
-
-   The tag must exactly match the version in `package.json` or the release
-   workflow will fail.
-3. The [release workflow](./.github/workflows/release.yml) installs
-   dependencies, typechecks the package, stages it on npm with provenance,
-   and creates a draft GitHub release with generated release notes.
-   Prerelease versions are staged with the `next` npm tag; stable versions
-   use `latest`.
-4. Review the staged package and approve it to publish, or reject it if
-   anything is wrong. This can be done through npm's staged packages UI or
-   with the npm CLI:
-
-   ```bash
-   npm stage list @langfuse/pi-observability-plugin
-   npm stage view <stage-id>
-   npm stage approve <stage-id>
-   # Or: npm stage reject <stage-id>
-   ```
-
-   Approval and rejection require npm two-factor authentication.
-5. Publish the draft GitHub release after the staged npm package is approved.
+This fork is currently used from source. The inherited npm publishing workflow
+has been removed, and `private: true` prevents npm publication of this checkout.
+Any future fork-owned package name or release process needs a separate decision;
+this repository does not publish the upstream Langfuse package.
 
 ## License
 
