@@ -39,25 +39,34 @@ export function validateEmbeddedOptions(options: EmbeddedLangfuseOptions): Embed
     }
     return value.trim();
   };
+
   const publicKey = required(options?.publicKey);
   const secretKey = required(options?.secretKey);
+
   let endpoint: URL;
   try {
     endpoint = new URL(required(options?.endpoint));
   } catch {
     throw new Error("Invalid explicit Langfuse endpoint");
   }
-  if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+
+  const isHttpEndpoint = endpoint.protocol === "http:" || endpoint.protocol === "https:";
+  const hasCredentials = Boolean(endpoint.username || endpoint.password);
+  const hasQueryOrFragment = Boolean(endpoint.search || endpoint.hash);
+  if (!isHttpEndpoint || hasCredentials || hasQueryOrFragment) {
     throw new Error("Invalid explicit Langfuse endpoint");
   }
+
   const label = (value: unknown): string => {
     if (value === undefined) return "";
     if (typeof value !== "string") throw new Error("Invalid explicit Langfuse label");
     return value;
   };
+
   if (options.onExportIssue !== undefined && typeof options.onExportIssue !== "function") {
     throw new Error("Invalid explicit Langfuse diagnostic callback");
   }
+
   return {
     publicKey,
     secretKey,
@@ -73,9 +82,24 @@ export type ObservationOptions = StartObservationOptions & { asType?: "span" | "
 export interface OwnedRuntime {
   processor: Pick<LangfuseSpanProcessor, "forceFlush">;
   shutdown: boolean;
-  start(name: string, attributes: LangfuseObservationAttributes, options: ObservationOptions & { asType: "generation" }, attribution: TraceAttributes): LangfuseGeneration;
-  start(name: string, attributes: LangfuseObservationAttributes, options: ObservationOptions & { asType: "tool" }, attribution: TraceAttributes): LangfuseTool;
-  start(name: string, attributes: LangfuseObservationAttributes, options: ObservationOptions & { asType: "span" }, attribution: TraceAttributes): LangfuseSpan;
+  start(
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions & { asType: "generation" },
+    attribution: TraceAttributes,
+  ): LangfuseGeneration;
+  start(
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions & { asType: "tool" },
+    attribution: TraceAttributes,
+  ): LangfuseTool;
+  start(
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions & { asType: "span" },
+    attribution: TraceAttributes,
+  ): LangfuseSpan;
   dispose(): Promise<void>;
 }
 
@@ -86,11 +110,15 @@ function assertNoAmbientExporterHeaders(): void {
   }
 }
 
-export function createOwnedRuntime(config: EmbeddedConfig, onExportIssue?: EmbeddedLangfuseOptions["onExportIssue"]): OwnedRuntime {
+export function createOwnedRuntime(
+  config: EmbeddedConfig,
+  onExportIssue?: EmbeddedLangfuseOptions["onExportIssue"],
+): OwnedRuntime {
   const reportedIssues = new Set<ExportIssueCode>();
   const reportIssue = (code: ExportIssueCode) => {
     if (reportedIssues.has(code)) return;
     reportedIssues.add(code);
+
     try {
       if (onExportIssue) onExportIssue(Object.freeze({ code }));
       else console.error("[pi-langfuse]", code);
@@ -98,6 +126,7 @@ export function createOwnedRuntime(config: EmbeddedConfig, onExportIssue?: Embed
       // Caller diagnostics cannot break tracing or expose arbitrary exceptions.
     }
   };
+
   const redactSecrets = createSecretRedactor(config.publicKey, config.secretKey);
   assertNoAmbientExporterHeaders();
   const processor = new LangfuseSpanProcessor({
@@ -113,6 +142,7 @@ export function createOwnedRuntime(config: EmbeddedConfig, onExportIssue?: Embed
     mask: ({ data }) => redactSecrets(data),
     shouldExportSpan: ({ otelSpan }) => typeof otelSpan.attributes["langfuse.observation.type"] === "string",
   });
+
   const openSpans = new Map<string, Span>();
   const provider = new NodeTracerProvider({
     resource: resourceFromAttributes({ "service.name": "pi-langfuse-embedded" }),
@@ -131,24 +161,51 @@ export function createOwnedRuntime(config: EmbeddedConfig, onExportIssue?: Embed
       shutdown: () => processor.shutdown(),
     }],
   });
+
   const tracer = provider.getTracer("langfuse-sdk", "5.10.1");
   let disposePromise: Promise<void> | undefined;
 
-  function start(name: string, attributes: LangfuseObservationAttributes, options: ObservationOptions & { asType: "generation" }, attribution: TraceAttributes): LangfuseGeneration;
-  function start(name: string, attributes: LangfuseObservationAttributes, options: ObservationOptions & { asType: "tool" }, attribution: TraceAttributes): LangfuseTool;
-  function start(name: string, attributes: LangfuseObservationAttributes, options: ObservationOptions & { asType: "span" }, attribution: TraceAttributes): LangfuseSpan;
-  function start(name: string, attributes: LangfuseObservationAttributes, options: ObservationOptions, attribution: TraceAttributes) {
+  function start(
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions & { asType: "generation" },
+    attribution: TraceAttributes,
+  ): LangfuseGeneration;
+  function start(
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions & { asType: "tool" },
+    attribution: TraceAttributes,
+  ): LangfuseTool;
+  function start(
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions & { asType: "span" },
+    attribution: TraceAttributes,
+  ): LangfuseSpan;
+  function start(
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions,
+    attribution: TraceAttributes,
+  ) {
     if (runtime.shutdown) throw new Error("Langfuse runtime is disposed");
+
     const kind = options.asType ?? "span";
     const parentContext = options.parentSpanContext
       ? trace.setSpanContext(ROOT_CONTEXT, options.parentSpanContext)
       : ROOT_CONTEXT;
-    const initialAttributes = { ...createObservationAttributes(kind, attributes), ...structuredClone(attribution) };
-    const otelSpan = tracer.startSpan(name, {
-      attributes: initialAttributes,
-      startTime: options.startTime,
-    }, parentContext);
-    // Child convenience methods select a global provider; see README embedding limits.
+    const initialAttributes = {
+      ...createObservationAttributes(kind, attributes),
+      ...structuredClone(attribution),
+    };
+    const otelSpan = tracer.startSpan(
+      name,
+      { attributes: initialAttributes, startTime: options.startTime },
+      parentContext,
+    );
+
+    // Construct wrappers directly: their child convenience methods use a global provider.
     if (kind === "generation") return new LangfuseGeneration({ otelSpan });
     if (kind === "tool") return new LangfuseTool({ otelSpan });
     return new LangfuseSpan({ otelSpan });
@@ -168,11 +225,14 @@ export function createOwnedRuntime(config: EmbeddedConfig, onExportIssue?: Embed
     },
     dispose() {
       if (disposePromise) return disposePromise;
+
       runtime.shutdown = true;
       for (const span of openSpans.values()) span.end();
+
       disposePromise = provider.shutdown().catch(() => reportIssue("shutdown-failed"));
       return disposePromise;
     },
   };
+
   return runtime;
 }

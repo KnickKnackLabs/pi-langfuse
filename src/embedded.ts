@@ -26,8 +26,10 @@ export function createEmbeddedLangfuse(options: EmbeddedLangfuseOptions): Embedd
     },
     dispose() {
       if (disposePromise) return disposePromise;
+
       for (const finalizePrompt of finalizePrompts) finalizePrompt();
       finalizePrompts.clear();
+
       disposePromise = runtime.dispose();
       return disposePromise;
     },

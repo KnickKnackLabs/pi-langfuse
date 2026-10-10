@@ -7,7 +7,8 @@ function escapeRegExpLiteral(text: string): string {
 }
 
 export function createSecretRedactor(...extraSecrets: string[]): (value: unknown) => unknown {
-  const alternatives = extraSecrets.filter((secret) => secret.length > 0).map(escapeRegExpLiteral);
+  const nonemptySecrets = extraSecrets.filter((secret) => secret.length > 0);
+  const alternatives = nonemptySecrets.map(escapeRegExpLiteral);
   alternatives.push(LANGFUSE_KEY_TOKEN);
   const pattern = new RegExp(alternatives.join("|"), "g");
 
@@ -30,5 +31,6 @@ export function createSecretRedactor(...extraSecrets: string[]): (value: unknown
     }
     return fields;
   };
+
   return (value) => walk(value, []);
 }

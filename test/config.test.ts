@@ -55,12 +55,18 @@ describe("loadConfig", () => {
   });
 
   it("keeps CLI configuration independent of the embedded exporter header guard", () => {
-    writeConfigFile({ publicKey: "pk-lf-file", secretKey: "sk-lf-file", baseUrl: "http://127.0.0.1:9999" });
+    writeConfigFile({
+      publicKey: "pk-lf-file",
+      secretKey: "sk-lf-file",
+      baseUrl: "http://127.0.0.1:9999",
+    });
     process.env.OTEL_EXPORTER_OTLP_HEADERS = "x-synthetic-private=SYNTHETIC_GENERIC_CREDENTIAL";
     process.env.OTEL_EXPORTER_OTLP_TRACES_HEADERS = "x-synthetic-private=SYNTHETIC_TRACE_CREDENTIAL";
     const beforeEnvironment = { ...process.env };
 
-    assert.equal(loadConfig()?.publicKey, "pk-lf-file");
+    const config = loadConfig();
+
+    assert.equal(config?.publicKey, "pk-lf-file");
     assert.deepEqual({ ...process.env }, beforeEnvironment);
   });
 

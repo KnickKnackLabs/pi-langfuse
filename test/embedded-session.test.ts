@@ -12,7 +12,7 @@ import {
 import { createEmbeddedLangfuse } from "../src/embedded.ts";
 import { createSandbox, startCaptureServer, startMockProvider } from "./helpers.ts";
 
-it("traces a neutral SDK 1.1.0 session through the explicit factory without CLI configuration", async () => {
+it("traces serial SDK 1.1.0 prompts and keeps tracing available after session shutdown", async () => {
   const provider = await startMockProvider();
   const capture = await startCaptureServer();
   const sandbox = createSandbox(provider.port);
@@ -23,6 +23,7 @@ it("traces a neutral SDK 1.1.0 session through the explicit factory without CLI 
     secretKey: "fake-session-secret",
     labels: { userId: "neutral-user", environment: "test", release: "test" },
   });
+
   const resources = new DefaultResourceLoader({
     cwd: sandbox.workspace,
     agentDir: sandbox.agentDir,
@@ -35,6 +36,7 @@ it("traces a neutral SDK 1.1.0 session through the explicit factory without CLI 
     noContextFiles: true,
   });
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+
   try {
     const modelRuntime = await ModelRuntime.create({
       modelsPath: join(sandbox.agentDir, "models.json"),
@@ -45,8 +47,10 @@ it("traces a neutral SDK 1.1.0 session through the explicit factory without CLI 
     });
     const model = modelRuntime.getModel("mock", "mock-gpt-1");
     assert.ok(model);
+
     await resources.reload();
     assert.deepEqual(resources.getExtensions().errors, []);
+
     ({ session } = await createAgentSession({
       cwd: sandbox.workspace,
       agentDir: sandbox.agentDir,
@@ -57,24 +61,44 @@ it("traces a neutral SDK 1.1.0 session through the explicit factory without CLI 
       sessionManager: SessionManager.inMemory(sandbox.workspace),
       settingsManager: settings,
     }));
+
     await session.prompt("Inspect this neutral test workspace.");
     await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+
     await session.prompt("Inspect this neutral test workspace again.");
     await tracing.dispose();
 
     const exported = capture.spans();
     const sessionId = session.sessionManager.getSessionId();
     const roots = exported.filter((span) => span.name === "Conversational Turn");
-    const generations = exported.filter((span) => span.attrs["langfuse.observation.type"] === "generation");
-    const tools = exported.filter((span) => span.attrs["langfuse.observation.type"] === "tool");
+    const generations = exported.filter(
+      (span) => span.attrs["langfuse.observation.type"] === "generation",
+    );
+    const tools = exported.filter(
+      (span) => span.attrs["langfuse.observation.type"] === "tool",
+    );
+    const expectedOutput = JSON.stringify({
+      role: "assistant",
+      content: "This is the test workspace. Done.",
+    });
+
     assert.equal(roots.length, 2);
     assert.ok(generations.length >= 2);
     assert.ok(tools.length >= 2);
-    assert.ok(exported.every((span) => span.attrs["session.id"] === sessionId));
-    assert.ok(exported.every((span) => span.attrs["user.id"] === "neutral-user"));
-    assert.ok(roots.every((span) => span.attrs["langfuse.observation.output"] === '{"role":"assistant","content":"This is the test workspace. Done."}'));
-    for (const span of [...generations, ...tools]) {
-      assert.ok(roots.some((root) => span.parentSpanId === root.spanId && span.traceId === root.traceId));
+
+    for (const span of exported) {
+      assert.equal(span.attrs["session.id"], sessionId);
+      assert.equal(span.attrs["user.id"], "neutral-user");
+    }
+    for (const root of roots) {
+      assert.equal(root.attrs["langfuse.observation.output"], expectedOutput);
+    }
+
+    const children = [...generations, ...tools];
+    for (const child of children) {
+      const parent = roots.find((root) => root.spanId === child.parentSpanId);
+      assert.ok(parent);
+      assert.equal(child.traceId, parent.traceId);
     }
   } finally {
     session?.dispose();
