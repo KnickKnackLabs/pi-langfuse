@@ -41,7 +41,8 @@ Stateless tools and model configuration can be shared by all six sessions.
 Session shutdown finalizes and drops only that session's tracing state, leaving
 the provider and other sessions available. After the sessions finish,
 call `await tracing.dispose()`. Disposal closes outstanding observations and
-attempts exporter shutdown. It is idempotent and permanent; subsequent loading
+attempts a final export, then shuts down the exporter and destroys its owned
+connections even if that export fails. It is idempotent and permanent; subsequent loading
 or work through the handle fails.
 
 The provider does not install a process-global provider or context manager.
@@ -49,11 +50,18 @@ Library tracing disables media uploads and CLI child-process parent propagation.
 
 ## Export and diagnostics
 
-Flush or disposal completion does not confirm storage in Langfuse. Export
-failures reaching the flush/shutdown boundary report `flush-failed` or
-`shutdown-failed`, once per code per handle. The optional callback receives only
+Each export batch has a three-second elapsed deadline, including retries. At
+the deadline, its sockets are destroyed and the export is marked failed, even
+if the server keeps sending an unfinished response. The standard OTLP exporter
+still owns serialization, response parsing and retries; redirects are not followed.
+This is a Node timer deadline, not a guarantee during an event-loop stall.
+
+Rejected or timed-out exports report `export-failed`, including automatic batches.
+A failed explicit flush or disposal also reports `flush-failed` or `shutdown-failed`.
+Each code is reported once per handle. The optional callback receives only
 `{ code }`; without a callback, the code is printed to stderr. Callback exceptions
-are contained.
+are contained. Notifications identify failed attempts, not a count of lost spans.
+Flush or disposal completion does not confirm storage in Langfuse.
 
 Keep dependency DEBUG logging off in production. Langfuse's `LANGFUSE_DEBUG` /
 `LANGFUSE_LOG_LEVEL` and OpenTelemetry diagnostic logging can print configuration
@@ -68,6 +76,6 @@ the locked exporter merges them into explicit request headers. The exporter
 captures headers at construction; later environment changes do not alter that
 handle. The plugin does not clear the variables itself.
 
-The exporter still reads ambient TLS certificate settings. Redirects, response
-handling and cancellation follow the dependency's behavior. This entry does not
-provide stricter transport or ingestion guarantees.
+The exporter still reads ambient TLS certificate settings. Response handling
+follows the dependency's behavior, including its interpretation of partial success.
+No Langfuse storage acknowledgement or durable retry queue is provided.

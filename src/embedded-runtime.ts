@@ -11,9 +11,10 @@ import { ROOT_CONTEXT, trace, type Span } from "@opentelemetry/api";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { AlwaysOnSampler, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { createSecretRedactor } from "./payload-redaction.ts";
+import { createEmbeddedExporter } from "./embedded-exporter.ts";
 
 export type TraceAttributes = Record<string, string | string[]>;
-export type ExportIssueCode = "flush-failed" | "shutdown-failed";
+export type ExportIssueCode = "export-failed" | "flush-failed" | "shutdown-failed";
 
 export interface EmbeddedLangfuseOptions {
   endpoint: string;
@@ -129,7 +130,9 @@ export function createOwnedRuntime(
 
   const redactSecrets = createSecretRedactor(config.publicKey, config.secretKey);
   assertNoAmbientExporterHeaders();
+  const exporter = createEmbeddedExporter(config, () => reportIssue("export-failed"));
   const processor = new LangfuseSpanProcessor({
+    exporter,
     publicKey: config.publicKey,
     secretKey: config.secretKey,
     baseUrl: config.baseUrl,
@@ -229,7 +232,20 @@ export function createOwnedRuntime(
       runtime.shutdown = true;
       for (const span of openSpans.values()) span.end();
 
-      disposePromise = provider.shutdown().catch(() => reportIssue("shutdown-failed"));
+      disposePromise = (async () => {
+        try {
+          await provider.shutdown();
+        } catch {
+          reportIssue("shutdown-failed");
+        } finally {
+          // BatchSpanProcessor skips exporter shutdown when its final flush rejects.
+          try {
+            await exporter.shutdown();
+          } catch {
+            reportIssue("shutdown-failed");
+          }
+        }
+      })();
       return disposePromise;
     },
   };
