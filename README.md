@@ -101,7 +101,15 @@ pnpm run typecheck
 pnpm test
 ```
 
-Pi loads the TypeScript source directly; there is no build step.
+Pi loads the TypeScript source directly; there is no build step. The tarball
+also contains source, so library consumers need a TypeScript-capable loader
+for its `@langfuse/pi-observability-plugin/embedded` entry.
+
+The embedded tests use SDK 1.1.0, including three traced and three untraced
+overlapping sessions. CI's `PI_BIN` matrix varies the CLI subprocess only;
+it does not establish embedded compatibility with those other versions.
+The package check loads both fork entries from an installed tarball and checks
+caller disposal. It does not send model requests or live Langfuse traffic.
 
 [MIT license](LICENSE). For upstream troubleshooting, see
 [Langfuse's Pi integration guide](https://langfuse.com/integrations/developer-tools/pi-agent).
