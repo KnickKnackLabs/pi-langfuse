@@ -214,6 +214,22 @@ export function createOwnedRuntime(
     return new LangfuseSpan({ otelSpan });
   }
 
+  async function shutdownResources() {
+    try {
+      await provider.shutdown();
+    } catch {
+      reportIssue("shutdown-failed");
+    }
+
+    // BatchSpanProcessor skips exporter shutdown when its final flush rejects.
+    // Shut it down explicitly on both paths; the exporter owns its connections.
+    try {
+      await exporter.shutdown();
+    } catch {
+      reportIssue("shutdown-failed");
+    }
+  }
+
   const runtime: OwnedRuntime = {
     shutdown: false,
     start,
@@ -232,20 +248,7 @@ export function createOwnedRuntime(
       runtime.shutdown = true;
       for (const span of openSpans.values()) span.end();
 
-      disposePromise = (async () => {
-        try {
-          await provider.shutdown();
-        } catch {
-          reportIssue("shutdown-failed");
-        } finally {
-          // BatchSpanProcessor skips exporter shutdown when its final flush rejects.
-          try {
-            await exporter.shutdown();
-          } catch {
-            reportIssue("shutdown-failed");
-          }
-        }
-      })();
+      disposePromise = shutdownResources();
       return disposePromise;
     },
   };

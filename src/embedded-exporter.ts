@@ -4,47 +4,93 @@ import { Agent as HttpsAgent } from "node:https";
 import type { Duplex } from "node:stream";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import type { SpanExporter } from "@opentelemetry/sdk-trace-node";
-import type { EmbeddedConfig } from "./embedded-runtime.ts";
 
 const EXPORT_DEADLINE_MS = 3_000;
 const SUCCESS = 0;
 const FAILED = 1;
 
-type ExportCallback = Parameters<SpanExporter["export"]>[1];
-interface ExportAttempt {
-  expired: boolean;
-  sockets: Set<Duplex>;
+interface ExporterConfig {
+  baseUrl: string;
+  publicKey: string;
+  secretKey: string;
 }
 
-// Keep the standard OTLP serializer/retry policy. Own only its connections and
-// result boundary: the dependency timeout measures inactivity, not elapsed time.
-export function createEmbeddedExporter(config: EmbeddedConfig, reportFailure: () => void): SpanExporter {
-  const attempts = new AsyncLocalStorage<ExportAttempt>();
-  const agent = config.baseUrl.startsWith("https:")
+type ExportCallback = Parameters<SpanExporter["export"]>[1];
+type ExportAttempt = ReturnType<typeof createExportAttempt>;
+
+// One batch owns one deadline, including retry waits and any retry connections.
+function createExportAttempt(callback: ExportCallback, reportFailure: () => void) {
+  const sockets = new Set<Duplex>();
+  let expired = false;
+  let completed = false;
+  const deadline = setTimeout(expire, EXPORT_DEADLINE_MS);
+
+  function finish(result: Parameters<ExportCallback>[0]) {
+    if (completed) return;
+    completed = true;
+    clearTimeout(deadline);
+
+    if (expired) {
+      result = { code: FAILED, error: new Error("Langfuse export deadline exceeded") };
+    }
+    if (result.code !== SUCCESS) reportFailure();
+    callback(result);
+  }
+
+  function expire() {
+    expired = true;
+    for (const socket of sockets) {
+      socket.destroy(new Error("Langfuse export deadline exceeded"));
+    }
+
+    // A response error can be reported as success by the standard transport.
+    finish({ code: FAILED, error: new Error("Langfuse export deadline exceeded") });
+  }
+
+  function trackSocket(socket: Duplex) {
+    if (sockets.has(socket)) return;
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+
+    // Retry connections may arrive after the batch has already expired.
+    if (expired) socket.destroy(new Error("Langfuse export deadline exceeded"));
+  }
+
+  return { finish, trackSocket };
+}
+
+function createExportAgent(baseUrl: string, attempts: AsyncLocalStorage<ExportAttempt>) {
+  const agent = baseUrl.startsWith("https:")
     ? new HttpsAgent({ keepAlive: false })
     : new HttpAgent({ keepAlive: false });
   const connect = agent.createConnection.bind(agent);
 
   agent.createConnection = (options, callback) => {
     const attempt = attempts.getStore();
-    const track = (socket: Duplex) => {
-      if (!attempt || attempt.sockets.has(socket)) return;
-      attempt.sockets.add(socket);
-      socket.once("close", () => attempt.sockets.delete(socket));
-      if (attempt.expired) socket.destroy(new Error("Langfuse export deadline exceeded"));
-    };
-    const socket = connect(options, callback && ((error, stream) => {
-      if (stream) track(stream);
-      callback(error, stream);
-    }));
-    if (socket) track(socket);
+    const onConnect: typeof callback = callback && ((error, socket) => {
+      if (socket) attempt?.trackSocket(socket);
+      callback(error, socket);
+    });
+
+    // Node can supply the connection directly or through the callback.
+    const socket = connect(options, onConnect);
+    if (socket) attempt?.trackSocket(socket);
     return socket;
   };
 
+  return agent;
+}
+
+// Keep the standard OTLP serializer/retry policy. Own only its connections and
+// result boundary: the dependency timeout measures inactivity, not elapsed time.
+export function createEmbeddedExporter(config: ExporterConfig, reportFailure: () => void): SpanExporter {
+  const attempts = new AsyncLocalStorage<ExportAttempt>();
+  const agent = createExportAgent(config.baseUrl, attempts);
+  const credentials = Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64");
   const delegate = new OTLPTraceExporter({
     url: `${config.baseUrl}/api/public/otel/v1/traces`,
     headers: {
-      Authorization: `Basic ${Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64")}`,
+      Authorization: `Basic ${credentials}`,
       "x-langfuse-sdk-name": "javascript",
       "x-langfuse-sdk-version": "5.10.1",
       "x-langfuse-public-key": config.publicKey,
@@ -61,32 +107,13 @@ export function createEmbeddedExporter(config: EmbeddedConfig, reportFailure: ()
         callback({ code: FAILED, error: new Error("Langfuse exporter is disposed") });
         return;
       }
-      const attempt: ExportAttempt = { expired: false, sockets: new Set() };
-      let completed = false;
-      const finish: ExportCallback = (result) => {
-        if (completed) return;
-        completed = true;
-        clearTimeout(deadline);
-        if (attempt.expired) {
-          result = { code: FAILED, error: new Error("Langfuse export deadline exceeded") };
-        }
-        if (result.code !== SUCCESS) reportFailure();
-        callback(result);
-      };
-      const deadline = setTimeout(() => {
-        attempt.expired = true;
-        for (const socket of attempt.sockets) {
-          socket.destroy(new Error("Langfuse export deadline exceeded"));
-        }
-        // A response error can be reported as success by the standard transport.
-        finish({ code: FAILED, error: new Error("Langfuse export deadline exceeded") });
-      }, EXPORT_DEADLINE_MS);
 
+      const attempt = createExportAttempt(callback, reportFailure);
       attempts.run(attempt, () => {
         try {
-          delegate.export(spans, finish);
+          delegate.export(spans, attempt.finish);
         } catch {
-          finish({ code: FAILED, error: new Error("Langfuse export failed") });
+          attempt.finish({ code: FAILED, error: new Error("Langfuse export failed") });
         }
       });
     },

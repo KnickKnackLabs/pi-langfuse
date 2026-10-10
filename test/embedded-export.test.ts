@@ -30,15 +30,30 @@ async function startEndpoint(reply: (response: ServerResponse, attempt: number) 
   return {
     endpoint: `http://127.0.0.1:${address.port}`,
     requests,
-    sockets,
+    async assertDisconnected() {
+      // Observe the client's abort before fixture cleanup can close connections.
+      for (const socket of sockets) await once(socket, "close");
+      assert.equal(sockets.size, 0, "export must close its connections before fixture cleanup");
+    },
     async close() {
       const closed = new Promise<void>((resolve, reject) => {
-        server.close((error) => error ? reject(error) : resolve());
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
       });
       server.closeAllConnections();
       await closed;
     },
   };
+}
+
+function sendUnfinishedResponse(response: ServerResponse) {
+  response.writeHead(200);
+  response.write(" ");
+
+  const trickle = setInterval(() => response.write(" "), 100);
+  response.once("close", () => clearInterval(trickle));
 }
 
 function runtimeFor(endpoint: string, reports: ExportIssueCode[], onReport?: () => void) {
@@ -107,7 +122,7 @@ describe("embedded export failure boundaries", () => {
     }
   });
 
-  it("fails a stalled shutdown within the configured transport timeout and aborts the request", { timeout: 15_000 }, async () => {
+  it("fails a stalled shutdown within the export deadline and aborts the request", { timeout: 15_000 }, async () => {
     const endpoint = await startEndpoint(() => {
       // Read the request, but send no response at all.
     });
@@ -119,14 +134,13 @@ describe("embedded export failure boundaries", () => {
       const started = performance.now();
       await runtime.dispose();
       const elapsed = performance.now() - started;
+
       // Allow scheduling overhead, without accepting the processor's 30s fallback.
       assert.ok(elapsed < 8_000, `shutdown took ${elapsed.toFixed(0)}ms`);
       assert.deepEqual(reports, ["export-failed", "shutdown-failed"]);
       assert.equal(endpoint.requests.length, 1);
 
-      // The client's abort reaches the loopback server asynchronously.
-      for (const socket of endpoint.sockets) await once(socket, "close");
-      assert.equal(endpoint.sockets.size, 0);
+      await endpoint.assertDisconnected();
     } finally {
       await runtime.dispose();
       await endpoint.close();
@@ -134,12 +148,7 @@ describe("embedded export failure boundaries", () => {
   });
 
   it("aborts an unfinished trickling response at the absolute export deadline", { timeout: 15_000 }, async () => {
-    const endpoint = await startEndpoint((response) => {
-      response.writeHead(200);
-      response.write(" ");
-      const trickle = setInterval(() => response.write(" "), 100);
-      response.once("close", () => clearInterval(trickle));
-    });
+    const endpoint = await startEndpoint(sendUnfinishedResponse);
     const reports: ExportIssueCode[] = [];
     const runtime = runtimeFor(endpoint.endpoint, reports);
 
@@ -150,8 +159,7 @@ describe("embedded export failure boundaries", () => {
       assert.ok(performance.now() - started < 8_000, "trickling response bypassed deadline");
       assert.deepEqual(reports, ["export-failed", "shutdown-failed"]);
       assert.equal(endpoint.requests.length, 1);
-      for (const socket of endpoint.sockets) await once(socket, "close");
-      assert.equal(endpoint.sockets.size, 0, "disposal must close the request before fixture cleanup");
+      await endpoint.assertDisconnected();
     } finally {
       await runtime.dispose();
       await endpoint.close();
@@ -165,10 +173,7 @@ describe("embedded export failure boundaries", () => {
         response.end("{}");
         return;
       }
-      response.writeHead(200);
-      response.write(" ");
-      const trickle = setInterval(() => response.write(" "), 100);
-      response.once("close", () => clearInterval(trickle));
+      sendUnfinishedResponse(response);
     });
     const healthy = await startEndpoint((response) => response.end("{}"));
     const failedReports: ExportIssueCode[] = [];
@@ -184,8 +189,7 @@ describe("embedded export failure boundaries", () => {
       assert.ok(performance.now() - started < 3_800, "retry reset the absolute deadline");
       assert.equal(failing.requests.length, 2);
       assert.deepEqual(failedReports, ["export-failed", "shutdown-failed"]);
-      for (const socket of failing.sockets) await once(socket, "close");
-      assert.equal(failing.sockets.size, 0);
+      await failing.assertDisconnected();
 
       finishRoot(healthyRuntime, "still-usable-root");
       await healthyRuntime.dispose();
@@ -203,9 +207,11 @@ describe("embedded export failure boundaries", () => {
       response.end("SYNTHETIC_PRIVATE_ERROR_BODY");
     });
     const reports: ExportIssueCode[] = [];
-    let reported!: () => void;
-    const failure = new Promise<void>((resolve) => { reported = resolve; });
-    const runtime = runtimeFor(endpoint.endpoint, reports, reported);
+    let notifyFailure!: () => void;
+    const failure = new Promise<void>((resolve) => {
+      notifyFailure = resolve;
+    });
+    const runtime = runtimeFor(endpoint.endpoint, reports, notifyFailure);
 
     try {
       for (let index = 0; index < 64; index++) finishRoot(runtime, `background-${index}`);
@@ -213,8 +219,7 @@ describe("embedded export failure boundaries", () => {
       assert.deepEqual(reports, ["export-failed"]);
       await runtime.dispose();
       assert.deepEqual(reports, ["export-failed"]);
-      for (const socket of endpoint.sockets) await once(socket, "close");
-      assert.equal(endpoint.sockets.size, 0);
+      await endpoint.assertDisconnected();
     } finally {
       await runtime.dispose();
       await endpoint.close();
