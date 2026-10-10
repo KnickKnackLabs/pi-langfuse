@@ -29,6 +29,10 @@
       "./src/index.ts"
     ]
   },
+  "exports": {
+    ".": "./src/index.ts",
+    "./embedded": "./src/embedded.ts"
+  },
   "files": [
     "src",
     "README.md",
@@ -37,7 +41,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.ts",
-    "test:unit": "node --test test/unit.test.ts test/config.test.ts"
+    "test:unit": "node --test test/unit.test.ts test/config.test.ts",
+    "test:embedded": "node --test test/embedded*.test.ts"
   },
   "dependencies": {
     "@langfuse/otel": "^5.10.0",
@@ -51,7 +56,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "1.1.0",
     "@types/node": "^24.0.0",
     "npm": "11.15.0",
     "typescript": "^5.7.0"
