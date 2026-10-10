@@ -1,8 +1,9 @@
 packages:
   - "."
 
-# Both come from the @earendil-works/pi-coding-agent devDependency that the
-# integration tests run against.
+# These come from the @earendil-works/pi-coding-agent devDependency that the
+# integration tests run against. esbuild is pulled in by @earendil-works/chord.
 allowBuilds:
   "@google/genai": true
+  esbuild: true
   protobufjs: true
