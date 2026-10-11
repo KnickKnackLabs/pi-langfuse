@@ -131,9 +131,9 @@ jobs:
           cd "$RUNNER_TEMP/consumer"
           npm init -y > /dev/null
           npm install --legacy-peer-deps "$TARBALL"
-      - name: Load the tracing entry point
+      - name: Load the fork's CLI and embedded entries through SDK 1.1.0
         working-directory: ${{ runner.temp }}/consumer
-        run: node --input-type=module -e "await import('@langfuse/otel'); console.log('The tracing entry point loaded.')"
+        run: node "$GITHUB_WORKSPACE/test/fixtures/packed-consumer.mjs" "$PWD"
       - name: Check that every required peer dependency is present
         working-directory: ${{ runner.temp }}/consumer
         run: |

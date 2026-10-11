@@ -1,4 +1,3 @@
-
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -10,6 +9,7 @@ import {
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import {
   type LangfuseSpan,
+  type LangfuseObservationAttributes,
   type LangfuseGeneration,
   LangfuseOtelSpanAttributes,
   type LangfuseTool,
@@ -19,6 +19,10 @@ import {
 import { type SpanContext, TraceFlags } from "@opentelemetry/api";
 import { defaultResource, detectResources, envDetector } from "@opentelemetry/resources";
 import { AlwaysOnSampler, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import type { OwnedRuntime, ObservationOptions } from "./embedded-runtime.ts";
+import { createSecretRedactor } from "./payload-redaction.ts";
+
+export { createSecretRedactor } from "./payload-redaction.ts";
 
 const EXTENSION_NAME = "@langfuse/pi-observability-plugin";
 const EXTENSION_VERSION = "0.1.2";
@@ -98,7 +102,7 @@ function readParentIds(env: NodeJS.ProcessEnv): ParentIds | undefined {
   if (raw) {
     const parsed = parseTraceparent(raw);
     if (parsed) return { ...parsed, source: "attached" };
-    console.error(`[pi-langfuse] Ignoring malformed ${ENV_TRACEPARENT}: ${JSON.stringify(raw)}`);
+    console.error(`[pi-langfuse] Ignoring malformed ${ENV_TRACEPARENT}`);
   }
   const traceId = env[ENV_PARENT_TRACE_ID]?.trim().toLowerCase();
   const spanId = env[ENV_PARENT_SPAN_ID]?.trim().toLowerCase();
@@ -153,10 +157,8 @@ function readConfigFile(): Partial<Record<keyof LangfuseConfig, unknown>> {
     if (!existsSync(path)) return {};
     const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
     return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-  } catch (error) {
-    console.error(
-      `[pi-langfuse] Ignoring unreadable langfuse.json: ${(error as Error).message}`,
-    );
+  } catch {
+    console.error("[pi-langfuse] Ignoring unreadable langfuse.json");
     return {};
   }
 }
@@ -164,42 +166,6 @@ function readConfigFile(): Partial<Record<keyof LangfuseConfig, unknown>> {
 // ---------------------------------------------------------------------------
 // Payload helpers
 // ---------------------------------------------------------------------------
-
-const SECRET_REDACTION_MARK = "[redacted-langfuse-secret]";
-const CYCLE_MARK = "[circular-ref]";
-const LANGFUSE_KEY_TOKEN = String.raw`\b[sp]k-lf-[\w-]+\b`;
-
-function escapeRegExpLiteral(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-export function createSecretRedactor(...extraSecrets: string[]): (value: unknown) => unknown {
-  const alternatives = extraSecrets.filter((s) => s.length > 0).map(escapeRegExpLiteral);
-  alternatives.push(LANGFUSE_KEY_TOKEN);
-  const pattern = new RegExp(alternatives.join("|"), "g");
-  const walk = (value: unknown, ancestors: readonly object[]): unknown => {
-    if (typeof value === "string") return value.replace(pattern, SECRET_REDACTION_MARK);
-    if (value === null || typeof value !== "object") return value;
-    if (ancestors.includes(value)) return CYCLE_MARK;
-    const chain = [...ancestors, value];
-    if (Array.isArray(value)) {
-      const items: unknown[] = [];
-      for (const item of value) items.push(walk(item, chain));
-      return items;
-    }
-    const fields: Record<string, unknown> = {};
-    for (const [key, field] of Object.entries(value)) {
-      Object.defineProperty(fields, key, {
-        value: walk(field, chain),
-        enumerable: true,
-        writable: true,
-        configurable: true,
-      });
-    }
-    return fields;
-  };
-  return (value) => walk(value, []);
-}
 
 const redactLangfuseKeys = createSecretRedactor();
 
@@ -595,12 +561,12 @@ export function buildCostDetails(usage: PiUsage): Record<string, number> | undef
 }
 
 // ---------------------------------------------------------------------------
-// Runtime (isolated OTEL provider — never touches the global provider)
+// CLI runtime (retains legacy process-global Langfuse provider selection)
 // ---------------------------------------------------------------------------
 
 type TraceAttributes = Record<string, string | string[]>;
 
-interface Runtime {
+interface CliRuntime {
   processor: LangfuseSpanProcessor;
   provider: NodeTracerProvider;
   shutdown: boolean;
@@ -611,10 +577,10 @@ function isLangfuseSpan(span: { attributes: Record<string, unknown> }): boolean 
   return typeof observationType === "string";
 }
 
-function createRuntime(
+function createCliRuntime(
   config: LangfuseConfig,
   resolveTraceAttributes: () => TraceAttributes,
-): Runtime {
+): CliRuntime {
   const redactSecrets = createSecretRedactor(config.publicKey, config.secretKey);
   const processor = new LangfuseSpanProcessor({
     publicKey: config.publicKey,
@@ -644,7 +610,7 @@ function createRuntime(
 }
 
 // ---------------------------------------------------------------------------
-// Per-prompt trace state
+// Session and prompt trace state
 // ---------------------------------------------------------------------------
 
 interface OpenGeneration {
@@ -668,13 +634,24 @@ interface PromptState {
   systemPrompt?: string;
 }
 
+interface SessionTraceState {
+  prompt?: PromptState;
+  traceAttributes: TraceAttributes;
+  gitBranch?: string;
+  hadImages: boolean;
+  fallbackTurnCounter: number;
+  lastPromptText: string;
+  contextHistory?: ChatMlMessage[];
+  compactionStartedAt?: Date;
+}
+
 const DEBUG = process.env.PI_LANGFUSE_DEBUG === "true";
-const debug = (...args: unknown[]) => {
+const cliDebug = (...args: unknown[]) => {
   if (DEBUG) console.error("[pi-langfuse]", ...args);
 };
 
 export default function (pi: ExtensionAPI) {
-  debug("factory start");
+  cliDebug("factory start");
   const config = loadConfig();
   if (!config) {
     pi.on("session_start", (_event, ctx) => {
@@ -685,19 +662,42 @@ export default function (pi: ExtensionAPI) {
     return;
   }
 
-  let runtime: Runtime | undefined;
-  let state: PromptState | undefined;
-  let traceAttributes: TraceAttributes = {};
-  let gitBranch: string | undefined;
-  let sessionHadImages = false;
-  let fallbackTurnCounter = 0;
-  let lastPromptText = "";
-  let lastContextHistory: ChatMlMessage[] | undefined;
-  let compactionStartedAt: Date | undefined;
-  const inheritedParent = readInheritedParent();
+  registerTracing(pi, config);
+}
+
+export function registerTracing(
+  pi: ExtensionAPI,
+  config: LangfuseConfig,
+  ownedRuntime?: OwnedRuntime,
+): () => void {
+  const debug = ownedRuntime ? () => {} : cliDebug;
+  const emitImageMedia = !ownedRuntime && EMIT_IMAGE_MEDIA;
+  let runtime: CliRuntime | undefined;
+  const sessions = new Map<string, SessionTraceState>();
+
+  // The CLI processor stamps attributes synchronously when a span starts.
+  // Embedded spans receive their session's attributes directly instead.
+  let cliTraceAttributes: TraceAttributes = {};
+
+  const sessionFor = (ctx: ExtensionContext): SessionTraceState => {
+    const id = ctx.sessionManager.getSessionId();
+    let session = sessions.get(id);
+    if (!session) {
+      session = {
+        traceAttributes: {},
+        hadImages: false,
+        fallbackTurnCounter: 0,
+        lastPromptText: "",
+      };
+      sessions.set(id, session);
+    }
+    return session;
+  };
+
+  const inheritedParent = ownedRuntime ? undefined : readInheritedParent();
   const isAttached = inheritedParent?.source === "attached";
   const externalTrace = inheritedParent?.externalTrace ?? false;
-  const inheritedParentEnv: Record<string, string | undefined> = {
+  const inheritedParentEnv: Record<string, string | undefined> = ownedRuntime ? {} : {
     [ENV_TRACEPARENT]: process.env[ENV_TRACEPARENT],
     [ENV_PARENT_TRACE_ID]: process.env[ENV_PARENT_TRACE_ID],
     [ENV_PARENT_SPAN_ID]: process.env[ENV_PARENT_SPAN_ID],
@@ -706,12 +706,65 @@ export default function (pi: ExtensionAPI) {
     [ENV_PARENT_EXTERNAL_TRACE]: process.env[ENV_PARENT_EXTERNAL_TRACE],
   };
 
-  const ensureRuntime = (): Runtime => {
-    if (!runtime || runtime.shutdown) runtime = createRuntime(config, () => traceAttributes);
-    return runtime;
+  const ensureRuntime = () => {
+    if (ownedRuntime) {
+      if (ownedRuntime.shutdown) throw new Error("Langfuse runtime is disposed");
+      return;
+    }
+    if (!runtime || runtime.shutdown) runtime = createCliRuntime(config, () => cliTraceAttributes);
   };
 
-  const resolveTurnNumber = (ctx: ExtensionContext, promptText: string): number => {
+  function observe(
+    session: SessionTraceState,
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions & { asType: "generation" },
+  ): LangfuseGeneration;
+  function observe(
+    session: SessionTraceState,
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions & { asType: "tool" },
+  ): LangfuseTool;
+  function observe(
+    session: SessionTraceState,
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions & { asType: "span" },
+  ): LangfuseSpan;
+  function observe(
+    session: SessionTraceState,
+    name: string,
+    attributes: LangfuseObservationAttributes,
+    options: ObservationOptions,
+  ) {
+    cliTraceAttributes = session.traceAttributes;
+    const traceAttributes = session.traceAttributes;
+    if (options.asType === "generation") {
+      const generationOptions = { ...options, asType: "generation" as const };
+      return ownedRuntime
+        ? ownedRuntime.start(name, attributes, generationOptions, traceAttributes)
+        : startObservation(name, attributes, generationOptions);
+    }
+
+    if (options.asType === "tool") {
+      const toolOptions = { ...options, asType: "tool" as const };
+      return ownedRuntime
+        ? ownedRuntime.start(name, attributes, toolOptions, traceAttributes)
+        : startObservation(name, attributes, toolOptions);
+    }
+
+    const spanOptions = { ...options, asType: "span" as const };
+    return ownedRuntime
+      ? ownedRuntime.start(name, attributes, spanOptions, traceAttributes)
+      : startObservation(name, attributes, spanOptions);
+  }
+
+  const resolveTurnNumber = (
+    session: SessionTraceState,
+    ctx: ExtensionContext,
+    promptText: string,
+  ): number => {
     try {
       const entries = ctx.sessionManager.getEntries() as Array<{
         type?: string;
@@ -725,16 +778,15 @@ export default function (pi: ExtensionAPI) {
       // before_agent_start may fire before or after the prompt is appended.
       if (last && extractText(last.message?.content) !== promptText) count += 1;
       if (count < 1) count = 1;
-      fallbackTurnCounter = count;
+      session.fallbackTurnCounter = count;
       return count;
     } catch {
-      fallbackTurnCounter += 1;
-      return fallbackTurnCounter;
+      session.fallbackTurnCounter += 1;
+      return session.fallbackTurnCounter;
     }
   };
 
-  const closeDanglingObservations = (reason: "interrupted" | "superseded") => {
-    if (!state) return;
+  const closeDanglingObservations = (state: PromptState, reason: "interrupted" | "superseded") => {
     for (const [, tool] of state.openTools) {
       tool.obs.update({ level: "WARNING", statusMessage: `Tool run ${reason}`, metadata: { [reason]: true } });
       tool.obs.end();
@@ -752,6 +804,7 @@ export default function (pi: ExtensionAPI) {
   // The turn root is the parent for subagents. pi runs tool calls in parallel,
   // so one global variable cannot point to one of many tool spans.
   const publishParentContext = (root: LangfuseSpan, sessionId: string) => {
+    if (ownedRuntime) return;
     const ctx = root.otelSpan.spanContext();
     // Do not publish a root that the sampler dropped. Child spans would point
     // to a trace with no exported root.
@@ -774,11 +827,12 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const finalizeRoot = (opts: { cancelled: boolean }) => {
+  const finalizeRoot = (session: SessionTraceState, opts: { cancelled: boolean }) => {
+    const state = session.prompt;
     if (!state) return;
-    closeDanglingObservations("interrupted");
-    const media = EMIT_IMAGE_MEDIA ? state.turnImages : [];
-    if (media.length) sessionHadImages = true;
+    closeDanglingObservations(state, "interrupted");
+    const media = emitImageMedia ? state.turnImages : [];
+    if (media.length) session.hadImages = true;
     state.root.update({
       input: media.length ? { role: "user", content: toMultimodalContent(state.userText, media) } : undefined,
       output: state.lastAssistantText ? { role: "assistant", content: state.lastAssistantText } : undefined,
@@ -790,7 +844,9 @@ export default function (pi: ExtensionAPI) {
     });
     state.root.end();
     withdrawParentContext();
-    state = undefined;
+    session.prompt = undefined;
+    session.contextHistory = undefined;
+    session.lastPromptText = "";
   };
 
   // Flushing must never block pi's exit or the next prompt indefinitely.
@@ -801,7 +857,11 @@ export default function (pi: ExtensionAPI) {
   // lives on and the upload finishes in the background.
   const FLUSH_TIMEOUT_MS = 3000;
   const EXIT_FLUSH_WITH_MEDIA_TIMEOUT_MS = 15000;
-  const flush = async (budgetMs: number = FLUSH_TIMEOUT_MS) => {
+  const flush = async (budgetMs: number = FLUSH_TIMEOUT_MS, hadImages = false) => {
+    if (ownedRuntime) {
+      await ownedRuntime.processor.forceFlush();
+      return;
+    }
     if (!runtime) return;
     try {
       let timer: NodeJS.Timeout | undefined;
@@ -813,7 +873,7 @@ export default function (pi: ExtensionAPI) {
         }),
       ]);
       if (timer) clearTimeout(timer);
-      if (raced === "timeout" && sessionHadImages) {
+      if (raced === "timeout" && hadImages) {
         console.error(
           `[pi-langfuse] flush timed out after ${budgetMs}ms with media pending — images may be missing from the trace`,
         );
@@ -825,29 +885,31 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     debug("session_start");
+    const session = sessionFor(ctx);
     if (ctx.hasUI) ctx.ui.setStatus("langfuse", "langfuse ✓");
     try {
       const result = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { timeout: 1000 });
-      gitBranch = result.code === 0 ? result.stdout.trim() : undefined;
+      session.gitBranch = result.code === 0 ? result.stdout.trim() : undefined;
     } catch {
-      gitBranch = undefined;
+      session.gitBranch = undefined;
     }
   });
 
   pi.on("before_agent_start", (event, ctx) => {
     debug("before_agent_start");
     ensureRuntime();
-    debug("runtime ready"); 
-    if (state) finalizeRoot({ cancelled: true });
+    debug("runtime ready");
+    const session = sessionFor(ctx);
+    finalizeRoot(session, { cancelled: true });
 
     const sessionId = ctx.sessionManager.getSessionId();
-    const turnNumber = resolveTurnNumber(ctx, event.prompt);
+    const turnNumber = resolveTurnNumber(session, ctx, event.prompt);
     const promptImages = extractImages(event.images);
     const userText = [event.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
-    lastPromptText = userText;
-    lastContextHistory = undefined;
+    session.lastPromptText = userText;
+    session.contextHistory = undefined;
     const isSubagent = inheritedParent?.source === "subagent";
-    traceAttributes = externalTrace
+    session.traceAttributes = externalTrace
       ? {}
       : {
           ...(isSubagent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: TRACE_NAME }),
@@ -858,7 +920,8 @@ export default function (pi: ExtensionAPI) {
           ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
         };
 
-    const root = startObservation(
+    const root = observe(
+      session,
       isSubagent ? SUBAGENT_ROOT_OBSERVATION_NAME : ROOT_OBSERVATION_NAME,
       {
         input: { role: "user", content: userText },
@@ -869,7 +932,7 @@ export default function (pi: ExtensionAPI) {
           session_id: sessionId,
           turn_number: turnNumber,
           cwd: ctx.cwd,
-          ...(gitBranch ? { git_branch: gitBranch } : {}),
+          ...(session.gitBranch ? { git_branch: session.gitBranch } : {}),
           ...(ctx.model ? { model: ctx.model.id, provider: ctx.model.provider } : {}),
           ...(isSubagent
             ? { pi_subagent: true, subagent_depth: inheritedParent!.depth, parent_session_id: inheritedParent!.sessionId }
@@ -880,7 +943,7 @@ export default function (pi: ExtensionAPI) {
       { asType: "span", ...(inheritedParent ? { parentSpanContext: inheritedParent.spanContext } : {}) },
     );
 
-    state = {
+    session.prompt = {
       root,
       turnNumber,
       generationCount: 0,
@@ -894,12 +957,14 @@ export default function (pi: ExtensionAPI) {
     debug("root created, turn", turnNumber);
   });
 
-  pi.on("context", (event) => {
-    lastContextHistory = buildHistoryInput(event.messages);
-    debug("context captured", lastContextHistory?.length ?? 0, "messages");
+  pi.on("context", (event, ctx) => {
+    const session = sessionFor(ctx);
+    session.contextHistory = buildHistoryInput(event.messages);
+    debug("context captured", session.contextHistory?.length ?? 0, "messages");
   });
 
   pi.on("agent_start", (_event, ctx) => {
+    const state = sessionFor(ctx).prompt;
     if (!state) return;
     const systemPrompt = readSystemPrompt(ctx);
     if (!systemPrompt) return;
@@ -911,6 +976,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_request", (event, ctx) => {
+    const session = sessionFor(ctx);
+    const state = session.prompt;
     if (!state) return;
     if (state.openGeneration && !state.openGeneration.finished) {
       const gen = state.openGeneration;
@@ -918,11 +985,11 @@ export default function (pi: ExtensionAPI) {
       gen.obs.end();
     }
     const index = ++state.generationCount;
-    const history = lastContextHistory;
+    const history = session.contextHistory;
     const baseInput: unknown[] =
       history ??
       (index === 1
-        ? [{ role: "user", content: lastPromptText }]
+        ? [{ role: "user", content: session.lastPromptText }]
         : state.pendingToolResults.length
           ? [{ role: "tool", tool_results: state.pendingToolResults }]
           : []);
@@ -932,7 +999,8 @@ export default function (pi: ExtensionAPI) {
         ? baseInput
         : undefined;
 
-    const obs = state.root.startObservation(
+    const obs = observe(
+      session,
       GENERATION_PREFIX,
       {
         input: attachToolDefinitions(generationInput, activeToolDefinitions(pi)),
@@ -945,13 +1013,13 @@ export default function (pi: ExtensionAPI) {
           ...(ctx.model ? { provider: ctx.model.provider, context_window: ctx.model.contextWindow } : {}),
         },
       },
-      { asType: "generation" },
+      { asType: "generation", parentSpanContext: state.root.otelSpan.spanContext() },
     );
     state.openGeneration = { obs, index, sawFirstToken: false, finished: false };
   });
 
-  pi.on("message_update", (event) => {
-    const gen = state?.openGeneration;
+  pi.on("message_update", (event, ctx) => {
+    const gen = sessionFor(ctx).prompt?.openGeneration;
     if (!gen || gen.finished || gen.sawFirstToken) return;
     const content = (event.message as { content?: unknown })?.content;
     if (
@@ -964,7 +1032,8 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("message_end", (event) => {
+  pi.on("message_end", (event, ctx) => {
+    const state = sessionFor(ctx).prompt;
     if (!state) return;
     const message = event.message as {
       role: string;
@@ -1022,7 +1091,9 @@ export default function (pi: ExtensionAPI) {
     state.pendingToolResults = [];
   });
 
-  pi.on("tool_execution_start", (event) => {
+  pi.on("tool_execution_start", (event, ctx) => {
+    const session = sessionFor(ctx);
+    const state = session.prompt;
     if (!state) return;
     const redactedArgs = redactLangfuseKeys(event.args) as Record<string, unknown>;
     const serializedArgs = safeStringify(redactedArgs);
@@ -1034,7 +1105,8 @@ export default function (pi: ExtensionAPI) {
         (uri) => `[data uri ~${Math.floor((uri.length * 3) / 4 / 1024)}KB]`,
       );
     }
-    const obs = state.root.startObservation(
+    const obs = observe(
+      session,
       `${TOOL_PREFIX} ${event.toolName}`,
       {
         input,
@@ -1043,12 +1115,14 @@ export default function (pi: ExtensionAPI) {
           tool_id: event.toolCallId,
         },
       },
-      { asType: "tool" },
+      { asType: "tool", parentSpanContext: state.root.otelSpan.spanContext() },
     );
     state.openTools.set(event.toolCallId, { obs, name: event.toolName, startedAt: new Date() });
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
+    const session = sessionFor(ctx);
+    const state = session.prompt;
     if (!state) return;
     const open = state.openTools.get(event.toolCallId);
     if (!open) return;
@@ -1061,7 +1135,8 @@ export default function (pi: ExtensionAPI) {
     state.turnImages.push(...images);
 
     if (result?.usage) {
-      const usageObs = startObservation(
+      const usageObs = observe(
+        session,
         TOOL_USAGE_OBSERVATION_NAME,
         {
           usageDetails: buildUsageDetails(result.usage),
@@ -1085,7 +1160,7 @@ export default function (pi: ExtensionAPI) {
         },
       );
       usageObs.end();
-      debug("tool result usage traced", open.name, result.usage.input, result.usage.output);
+      debug("tool result usage traced", result.usage.input, result.usage.output);
     }
 
     open.obs.update({
@@ -1117,8 +1192,10 @@ export default function (pi: ExtensionAPI) {
     },
     startedAt?: Date,
   ): void => {
+    const session = sessionFor(ctx);
+    const state = session.prompt;
     if (state) {
-      const obs = startObservation(name, attributes, {
+      const obs = observe(session, name, attributes, {
         asType: "generation",
         parentSpanContext: state.root.otelSpan.spanContext(),
         ...(startedAt ? { startTime: startedAt } : {}),
@@ -1126,11 +1203,10 @@ export default function (pi: ExtensionAPI) {
       obs.end();
       return;
     }
-    // ensureRuntime is otherwise only called in before_agent_start; an idle
-    // /compact in a fresh process would hit the unset tracer provider.
+    // Idle summaries need their own CLI runtime before any prompt has started.
     ensureRuntime();
     const sessionId = ctx.sessionManager.getSessionId();
-    traceAttributes = externalTrace
+    session.traceAttributes = externalTrace
       ? {}
       : {
           ...(inheritedParent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: `Pi ${name}` }),
@@ -1138,7 +1214,8 @@ export default function (pi: ExtensionAPI) {
           [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
           ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
         };
-    const obs = startObservation(
+    const obs = observe(
+      session,
       name,
       {
         ...attributes,
@@ -1158,15 +1235,16 @@ export default function (pi: ExtensionAPI) {
     );
     obs.end();
     void flush();
-  }
+  };
 
-  pi.on("session_before_compact", () => {
-    compactionStartedAt = new Date();
+  pi.on("session_before_compact", (_event, ctx) => {
+    sessionFor(ctx).compactionStartedAt = new Date();
   });
 
   pi.on("session_compact", (event, ctx) => {
-    const startedAt = compactionStartedAt;
-    compactionStartedAt = undefined;
+    const session = sessionFor(ctx);
+    const startedAt = session.compactionStartedAt;
+    session.compactionStartedAt = undefined;
     const entry = event.compactionEntry as
       | { summary?: string; tokensBefore?: number; usage?: PiUsage; fromHook?: boolean }
       | undefined;
@@ -1225,16 +1303,24 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
-    if (!state) return;
-    finalizeRoot({ cancelled: false });
-    await flush();
-    if (ctx.hasUI) ctx.ui.setStatus("langfuse", "langfuse ✓ (trace sent)");
+    const session = sessionFor(ctx);
+    if (!session.prompt) return;
+    finalizeRoot(session, { cancelled: false });
+    await flush(FLUSH_TIMEOUT_MS, session.hadImages);
+    if (ctx.hasUI) {
+      const status = ownedRuntime ? "langfuse ✓ (flush requested)" : "langfuse ✓ (trace sent)";
+      ctx.ui.setStatus("langfuse", status);
+    }
   });
 
-  pi.on("session_shutdown", async (event) => {
-    if (state) finalizeRoot({ cancelled: true });
-    const exitBudget = sessionHadImages ? EXIT_FLUSH_WITH_MEDIA_TIMEOUT_MS : FLUSH_TIMEOUT_MS;
-    await flush(exitBudget);
+  pi.on("session_shutdown", async (event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const session = sessions.get(sessionId);
+    if (!session) return;
+    finalizeRoot(session, { cancelled: true });
+    sessions.delete(sessionId);
+    const exitBudget = session.hadImages ? EXIT_FLUSH_WITH_MEDIA_TIMEOUT_MS : FLUSH_TIMEOUT_MS;
+    await flush(exitBudget, session.hadImages);
     if (event.reason === "quit" && runtime && !runtime.shutdown) {
       runtime.shutdown = true;
       try {
@@ -1252,6 +1338,11 @@ export default function (pi: ExtensionAPI) {
       }
     }
   });
+
+  return () => {
+    for (const session of sessions.values()) finalizeRoot(session, { cancelled: true });
+    sessions.clear();
+  };
 }
 
 function safeStringify(value: unknown): string {

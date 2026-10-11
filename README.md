@@ -1,164 +1,115 @@
-# Langfuse Observability Plugin for pi
+# Pi tracing for Langfuse
 
-This extension sends [pi coding agent](https://pi.dev) sessions to
-[Langfuse](https://langfuse.com). It records the user prompts, the agent turns,
-the model generations with their tokens and cost, and the tool calls.
+Send Pi prompts, model calls and tool calls to [Langfuse](https://langfuse.com),
+with conversation history, reasoning, token usage and cost. Each prompt becomes
+a trace; prompts from the same session share a session ID.
 
-The full setup guide is the
-[Pi Agent integration page](https://langfuse.com/integrations/developer-tools/pi-agent),
-which also covers troubleshooting.
+This is [KnickKnackLabs' source-only fork](https://github.com/KnickKnackLabs/pi-langfuse)
+of the official [Langfuse plugin](https://github.com/langfuse/pi-observability-plugin).
+It is experimental and private: install this checkout, not the upstream npm package.
 
-> [!WARNING]
-> This is an experimental release, so future versions can bring breaking changes.
+## CLI setup
 
-## What can this integration trace?
-
-The plugin listens to Pi's core lifecycle events and sends every user prompt to
-Langfuse as its own trace:
-
-- **Agent turns**: one trace per user prompt, with all turns of a Pi session
-  grouped under one session ID. Turn numbering survives a Pi restart.
-- **Model generations**: every model request with inputs, outputs, cost, time to
-  first token, and token usage including cache-read and reasoning splits.
-- **Conversation history**: each generation has all messages of that call.
-- **Reasoning**: each thinking block is on the step that made it.
-- **Tool calls**: each tool Pi invokes, with input, output, and an `ERROR` level
-  when the call fails.
-- **Images**: images you add to a prompt are uploaded as Langfuse media and
-  render inside the trace.
-- **Subagents**: Pi processes spawned by other extensions nest under the turn
-  that started them.
-
-## Prerequisites
-
-Pi needs Node.js 22.0.0 or newer, and pi's package installer shells out to
-`npm`, so npm has to be on your `PATH`.
-
-## Install
+Use Node.js 22+ and npm on your `PATH`. Install the checkout's dependencies,
+then add it to Pi:
 
 ```bash
-pi install npm:@langfuse/pi-observability-plugin
+cd /path/to/pi-langfuse
+pnpm install
+pi install /path/to/pi-langfuse
 ```
 
-To try it for a single run, without installing:
-
-```bash
-pi -e npm:@langfuse/pi-observability-plugin
-```
-
-## Add your Langfuse credentials
-
-Create a credentials file at `~/.pi/agent/langfuse.json`:
+Create `~/.pi/agent/langfuse.json` and keep it private:
 
 ```json
 {
   "publicKey": "pk-lf-...",
   "secretKey": "sk-lf-...",
-  "baseUrl": "https://cloud.langfuse.com",
-  "userId": "your-user-id",
-  "environment": "development"
+  "baseUrl": "http://localhost:3000"
 }
 ```
 
-Only `publicKey` and `secretKey` are required. If `baseUrl` is omitted, the
-plugin uses `https://cloud.langfuse.com` (EU region). `userId`, `environment`
-and `release` are optional labels that let you segment traces by teammate, stage
-or version. Keep the file private, because it holds a secret key.
-
-Alternatively, set your credentials with environment variables:
+Run Pi normally. To disable tracing for one run:
 
 ```bash
-export LANGFUSE_PUBLIC_KEY="pk-lf-..."
-export LANGFUSE_SECRET_KEY="sk-lf-..."
-export LANGFUSE_BASE_URL="https://cloud.langfuse.com"
-export LANGFUSE_TRACING_ENVIRONMENT="development"
-export LANGFUSE_USER_ID="your-user-id"
+LANGFUSE_TRACING_ENABLED=false pi
 ```
 
-Environment variables take precedence over the config file, so you can override
-a single value without editing the file.
+See [CLI configuration](docs/cli.md) for environment overrides, images,
+child-process tracing and removal.
 
-## Environment variables
+## Using Pi as a library
 
-| Variable                       | Description                                                                                                                                       | Required            |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
-| `LANGFUSE_PUBLIC_KEY`          | Your Langfuse public key (`pk-lf-...`)                                                                                                            | Yes                 |
-| `LANGFUSE_SECRET_KEY`          | Your Langfuse secret key (`sk-lf-...`)                                                                                                            | Yes                 |
-| `LANGFUSE_BASE_URL`            | Langfuse host. EU: `https://cloud.langfuse.com`, US: `https://us.cloud.langfuse.com`, Japan: `https://jp.cloud.langfuse.com`, HIPAA: `https://hipaa.cloud.langfuse.com` | No (defaults to EU) |
-| `LANGFUSE_TRACING_ENVIRONMENT` | Environment label for the traces (e.g. `production`)                                                                                              | No                  |
-| `LANGFUSE_USER_ID`             | User ID attached to all traces                                                                                                                    | No                  |
-| `OTEL_SERVICE_NAME`            | OpenTelemetry service name for the exported spans. Unset, OpenTelemetry's own default applies                                                     | No                  |
-| `OTEL_RESOURCE_ATTRIBUTES`     | Extra OpenTelemetry resource attributes as a comma-separated `key=value` list (e.g. `service.namespace=engineering,team.name=platform`). Langfuse shows them under `resourceAttributes` in the trace and observation metadata | No                  |
+With `@earendil-works/pi-coding-agent` **1.1.0**, give the factory your
+application's Langfuse configuration and load its extension through Pi:
 
-## Enable and disable tracing
+```typescript
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+} from "@earendil-works/pi-coding-agent";
+import { createEmbeddedLangfuse } from "./pi-langfuse/src/embedded.ts";
 
-| Scope                   | How                                                         |
-| ----------------------- | ----------------------------------------------------------- |
-| One run                 | `LANGFUSE_TRACING_ENABLED=false pi`                         |
-| The current shell       | `export LANGFUSE_TRACING_ENABLED=false` (undo with `unset`) |
-| Global or project scope | `pi config`, then switch the extension off                  |
-| Remove the plugin       | `pi remove npm:@langfuse/pi-observability-plugin`           |
+const tracing = createEmbeddedLangfuse({
+  endpoint: config.langfuseUrl,
+  publicKey: config.langfusePublicKey,
+  secretKey: config.langfuseSecretKey,
+});
 
-The kill switch has priority over environment keys and the config file. When
-tracing is off, the status line shows `langfuse: off (no keys)` and nothing is
-sent. This message reads the same whether the kill switch is set or the keys are
-genuinely missing. To remove stored keys, delete `~/.pi/agent/langfuse.json`.
+try {
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    extensionFactories: [tracing.extension],
+    noExtensions: true,
+  });
+  await loader.reload();
 
-`pi remove` needs the same source you installed from. For a local checkout, see
-[Development](#development).
+  const { session } = await createAgentSession({
+    cwd,
+    agentDir,
+    resourceLoader: loader,
+  });
+  try {
+    await session.prompt("What files are in this project?");
+  } finally {
+    session.dispose();
+  }
+} finally {
+  await tracing.dispose();
+}
+```
+
+Sessions can overlap through one shared loader and tracing handle. Give each
+session its own `SessionManager`; prompts within one session remain sequential.
+Use a loader without the tracing extension for sessions you don't want traced.
+The application disposes the handle after its sessions finish.
+
+Before creating the handle, clear `OTEL_EXPORTER_OTLP_HEADERS` and
+`OTEL_EXPORTER_OTLP_TRACES_HEADERS` in your deployment; nonempty values are
+refused. Keep dependency DEBUG logging off in production: it can print
+conversation contents and configuration.
+
+See [library configuration and lifecycle](docs/library.md) for labels,
+error reporting and transport limits. Library tracing disables image uploads
+and child-process parent propagation.
 
 ## Development
 
 ```bash
-pnpm install
 pnpm run typecheck
 pnpm test
 ```
 
-The package ships raw TypeScript and pi reads `src/index.ts` directly, so there
-is no build step. Therefore `files` in `package.json` holds only `src`,
-`README.md` and `LICENSE`.
+Pi loads the TypeScript source directly; there is no build step. The tarball
+also contains source, so library consumers need a TypeScript-capable loader
+for its `@langfuse/pi-observability-plugin/embedded` entry.
 
-To run a local checkout against pi:
+The embedded tests use SDK 1.1.0, including three traced and three untraced
+overlapping sessions. CI's `PI_BIN` matrix varies the CLI subprocess only;
+it does not establish embedded compatibility with those other versions.
+The package check loads both fork entries from an installed tarball and checks
+caller disposal. It does not send model requests or live Langfuse traffic.
 
-```bash
-pi install /absolute/path/to/pi-observability-plugin
-```
-
-Remove it again with `pi remove /absolute/path/to/pi-observability-plugin`.
-
-## Release
-
-1. Update the version in `package.json` and `EXTENSION_VERSION` in
-   `src/index.ts`, then merge the version bump into `main`.
-2. Tag that commit with the matching `v`-prefixed version and push the tag:
-
-   ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
-   ```
-
-   The tag must exactly match the version in `package.json` or the release
-   workflow will fail.
-3. The [release workflow](./.github/workflows/release.yml) installs
-   dependencies, typechecks the package, stages it on npm with provenance,
-   and creates a draft GitHub release with generated release notes.
-   Prerelease versions are staged with the `next` npm tag; stable versions
-   use `latest`.
-4. Review the staged package and approve it to publish, or reject it if
-   anything is wrong. This can be done through npm's staged packages UI or
-   with the npm CLI:
-
-   ```bash
-   npm stage list @langfuse/pi-observability-plugin
-   npm stage view <stage-id>
-   npm stage approve <stage-id>
-   # Or: npm stage reject <stage-id>
-   ```
-
-   Approval and rejection require npm two-factor authentication.
-5. Publish the draft GitHub release after the staged npm package is approved.
-
-## License
-
-[MIT](./LICENSE)
+[MIT license](LICENSE). For upstream troubleshooting, see
+[Langfuse's Pi integration guide](https://langfuse.com/integrations/developer-tools/pi-agent).

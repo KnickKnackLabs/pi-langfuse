@@ -1,6 +1,7 @@
 {
   "name": "@langfuse/pi-observability-plugin",
   "version": "0.1.2",
+  "private": true,
   "description": "Langfuse observability extension for the pi coding agent — traces prompts, agent turns, model generations, and tool calls to Langfuse.",
   "license": "MIT",
   "author": "Langfuse",
@@ -8,12 +9,12 @@
   "packageManager": "pnpm@11.22.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/langfuse/pi-observability-plugin.git"
+    "url": "git+https://github.com/KnickKnackLabs/pi-langfuse.git"
   },
   "bugs": {
-    "url": "https://github.com/langfuse/pi-observability-plugin/issues"
+    "url": "https://github.com/KnickKnackLabs/pi-langfuse/issues"
   },
-  "homepage": "https://github.com/langfuse/pi-observability-plugin#readme",
+  "homepage": "https://github.com/KnickKnackLabs/pi-langfuse#readme",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -28,15 +29,21 @@
       "./src/index.ts"
     ]
   },
+  "exports": {
+    ".": "./src/index.ts",
+    "./embedded": "./src/embedded.ts"
+  },
   "files": [
     "src",
+    "docs",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.ts",
-    "test:unit": "node --test test/unit.test.ts test/config.test.ts"
+    "test:unit": "node --test test/unit.test.ts test/config.test.ts",
+    "test:embedded": "node --test test/embedded*.test.ts"
   },
   "dependencies": {
     "@langfuse/otel": "^5.10.0",
@@ -46,14 +53,11 @@
     "@opentelemetry/resources": "^2.10.0",
     "@opentelemetry/sdk-trace-node": "^2.10.0"
   },
-  "publishConfig": {
-    "access": "public"
-  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "1.1.0",
     "@types/node": "^24.0.0",
     "npm": "11.15.0",
     "typescript": "^5.7.0"
