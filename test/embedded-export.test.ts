@@ -7,6 +7,7 @@ import {
   createOwnedRuntime,
   validateEmbeddedOptions,
   type ExportIssueCode,
+  type ExportIssue,
 } from "../src/embedded-runtime.ts";
 
 async function startEndpoint(reply: (response: ServerResponse, attempt: number) => void) {
@@ -74,6 +75,33 @@ function finishRoot(runtime: ReturnType<typeof runtimeFor>, name: string) {
 }
 
 describe("embedded export failure boundaries", () => {
+  for (const status of [401, 404]) {
+    it(`reports HTTP ${status} without the response body or credentials`, async () => {
+      const endpoint = await startEndpoint((response) => {
+        response.writeHead(status);
+        response.end("SYNTHETIC_PRIVATE_ERROR_BODY fake-export-secret");
+      });
+      const reports: ExportIssue[] = [];
+      const config = validateEmbeddedOptions({
+        endpoint: endpoint.endpoint, publicKey: "fake-export-public", secretKey: "fake-export-secret",
+      });
+      const runtime = createOwnedRuntime(config, (issue) => reports.push(issue));
+      try {
+        finishRoot(runtime, "rejected-root");
+        await runtime.dispose();
+        assert.deepEqual(reports, [
+          { code: "export-failed", failure: { reason: "http", httpStatus: status } },
+          { code: "shutdown-failed" },
+        ]);
+        assert.ok(!JSON.stringify(reports).includes("fake-export-secret"));
+        assert.ok(!JSON.stringify(reports).includes("SYNTHETIC_PRIVATE_ERROR_BODY"));
+      } finally {
+        await runtime.dispose();
+        await endpoint.close();
+      }
+    });
+  }
+
   it("reports rejected shutdown once, closes open observations and stays disposed", async () => {
     const endpoint = await startEndpoint((response) => {
       response.writeHead(400);

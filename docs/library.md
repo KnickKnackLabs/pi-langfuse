@@ -58,9 +58,15 @@ This is a Node timer deadline, not a guarantee during an event-loop stall.
 
 Rejected or timed-out exports report `export-failed`, including automatic batches.
 A failed explicit flush or disposal also reports `flush-failed` or `shutdown-failed`.
-Each code is reported once per handle. The optional callback receives only
-`{ code }`; without a callback, the code is printed to stderr. Callback exceptions
-are contained. Notifications identify failed attempts, not a count of lost spans.
+Each code is reported once per handle. The optional callback receives `{ code }`
+and, for an export failure, a `failure` object containing a recognized HTTP status,
+connection-error code, `timeout`, or `unknown` reason. For example:
+`{ code: "export-failed", failure: { reason: "http", httpStatus: 401 } }`.
+Messages, response bodies, headers, URLs and credentials are never included.
+Without a callback, this same safe object is printed to stderr. Callback exceptions
+are contained. The elapsed deadline takes precedence over earlier transport errors;
+retry exhaustion may therefore report `timeout` rather than an earlier HTTP status.
+Notifications identify failed attempts, not a count of lost spans.
 Flush or disposal completion does not confirm storage in Langfuse.
 
 Keep dependency DEBUG logging off in production. Langfuse's `LANGFUSE_DEBUG` /

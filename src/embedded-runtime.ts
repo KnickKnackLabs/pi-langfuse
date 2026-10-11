@@ -12,16 +12,18 @@ import { resourceFromAttributes } from "@opentelemetry/resources";
 import { AlwaysOnSampler, NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { createSecretRedactor } from "./payload-redaction.ts";
 import { createEmbeddedExporter } from "./embedded-exporter.ts";
+import type { ExportFailure } from "./export-failure.ts";
 
 export type TraceAttributes = Record<string, string | string[]>;
 export type ExportIssueCode = "export-failed" | "flush-failed" | "shutdown-failed";
+export type ExportIssue = Readonly<{ code: ExportIssueCode; failure?: ExportFailure }>;
 
 export interface EmbeddedLangfuseOptions {
   endpoint: string;
   publicKey: string;
   secretKey: string;
   labels?: { userId?: string; environment?: string; release?: string };
-  onExportIssue?: (issue: Readonly<{ code: ExportIssueCode }>) => void;
+  onExportIssue?: (issue: ExportIssue) => void;
 }
 
 export interface EmbeddedConfig {
@@ -116,13 +118,14 @@ export function createOwnedRuntime(
   onExportIssue?: EmbeddedLangfuseOptions["onExportIssue"],
 ): OwnedRuntime {
   const reportedIssues = new Set<ExportIssueCode>();
-  const reportIssue = (code: ExportIssueCode) => {
+  const reportIssue = (code: ExportIssueCode, failure?: ExportFailure) => {
     if (reportedIssues.has(code)) return;
     reportedIssues.add(code);
 
     try {
-      if (onExportIssue) onExportIssue(Object.freeze({ code }));
-      else console.error("[pi-langfuse]", code);
+      const issue: ExportIssue = Object.freeze({ code, ...(failure ? { failure } : {}) });
+      if (onExportIssue) onExportIssue(issue);
+      else console.error("[pi-langfuse]", issue);
     } catch {
       // Caller diagnostics cannot break tracing or expose arbitrary exceptions.
     }
@@ -130,7 +133,7 @@ export function createOwnedRuntime(
 
   const redactSecrets = createSecretRedactor(config.publicKey, config.secretKey);
   assertNoAmbientExporterHeaders();
-  const exporter = createEmbeddedExporter(config, () => reportIssue("export-failed"));
+  const exporter = createEmbeddedExporter(config, (failure) => reportIssue("export-failed", failure));
   const processor = new LangfuseSpanProcessor({
     exporter,
     publicKey: config.publicKey,

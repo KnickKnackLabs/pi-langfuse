@@ -4,6 +4,7 @@ import { Agent as HttpsAgent } from "node:https";
 import type { Duplex } from "node:stream";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import type { SpanExporter } from "@opentelemetry/sdk-trace-node";
+import { describeExportFailure, type ExportFailure } from "./export-failure.ts";
 
 const EXPORT_DEADLINE_MS = 3_000;
 const SUCCESS = 0;
@@ -19,7 +20,7 @@ type ExportCallback = Parameters<SpanExporter["export"]>[1];
 type ExportAttempt = ReturnType<typeof createExportAttempt>;
 
 // One batch owns one deadline, including retry waits and any retry connections.
-function createExportAttempt(callback: ExportCallback, reportFailure: () => void) {
+function createExportAttempt(callback: ExportCallback, reportFailure: (failure: ExportFailure) => void) {
   const sockets = new Set<Duplex>();
   let expired = false;
   let completed = false;
@@ -33,7 +34,7 @@ function createExportAttempt(callback: ExportCallback, reportFailure: () => void
     if (expired) {
       result = { code: FAILED, error: new Error("Langfuse export deadline exceeded") };
     }
-    if (result.code !== SUCCESS) reportFailure();
+    if (result.code !== SUCCESS) reportFailure(describeExportFailure(result.error, expired));
     callback(result);
   }
 
@@ -83,7 +84,10 @@ function createExportAgent(baseUrl: string, attempts: AsyncLocalStorage<ExportAt
 
 // Keep the standard OTLP serializer/retry policy. Own only its connections and
 // result boundary: the dependency timeout measures inactivity, not elapsed time.
-export function createEmbeddedExporter(config: ExporterConfig, reportFailure: () => void): SpanExporter {
+export function createEmbeddedExporter(
+  config: ExporterConfig,
+  reportFailure: (failure: ExportFailure) => void,
+): SpanExporter {
   const attempts = new AsyncLocalStorage<ExportAttempt>();
   const agent = createExportAgent(config.baseUrl, attempts);
   const credentials = Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64");

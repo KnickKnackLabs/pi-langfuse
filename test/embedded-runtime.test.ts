@@ -482,7 +482,10 @@ describe("explicit owned runtime", () => {
       secondRoot.end();
       await runtime.processor.forceFlush();
 
-      assert.deepEqual(reports, [{ code: "export-failed" }, { code: "flush-failed" }]);
+      assert.deepEqual(reports, [
+        { code: "export-failed", failure: { reason: "http", httpStatus: 400 } },
+        { code: "flush-failed" },
+      ]);
       assert.ok(reports.every(Object.isFrozen));
       assert.deepEqual(collector.failures, []);
     } finally {

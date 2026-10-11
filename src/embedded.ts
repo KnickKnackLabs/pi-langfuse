@@ -6,7 +6,8 @@ import {
   type EmbeddedLangfuseOptions,
 } from "./embedded-runtime.ts";
 
-export type { EmbeddedLangfuseOptions, ExportIssueCode } from "./embedded-runtime.ts";
+export type { EmbeddedLangfuseOptions, ExportIssueCode, ExportIssue } from "./embedded-runtime.ts";
+export type { ExportFailure } from "./export-failure.ts";
 
 export interface EmbeddedLangfuse {
   extension: ExtensionFactory;
